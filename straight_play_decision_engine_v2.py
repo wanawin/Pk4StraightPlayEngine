@@ -1,0 +1,929 @@
+# straight_play_decision_engine_v2.py
+# Reusable AABC straight-play companion app with live playlist + truth-member historical backtest
+# Build marker: STRAIGHT_DECISION_ENGINE_V2__2026-06-14
+
+from __future__ import annotations
+
+import io
+import itertools
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import pandas as pd
+import streamlit as st
+
+BUILD_ID = "STRAIGHT_DECISION_ENGINE_V2__2026-06-14"
+DEFAULT_RULE_DB = "straight_rule_database_CORE025_v1.csv"
+
+# -------------------------
+# Core utility functions
+# -------------------------
+
+def norm4(x: object) -> Optional[str]:
+    if x is None:
+        return None
+    d = re.findall(r"\d", str(x))
+    if len(d) < 4:
+        return None
+    return "".join(d[:4])
+
+
+def norm_member(x: object) -> Optional[str]:
+    r = norm4(x)
+    if not r:
+        return None
+    return "".join(sorted(r))
+
+
+def is_aabc_member(member: str) -> bool:
+    if not member or len(member) != 4:
+        return False
+    c = Counter(member)
+    return len(c) == 3 and sorted(c.values()) == [1, 1, 2]
+
+
+def unique_perms(member: str) -> List[str]:
+    member = norm_member(member) or str(member).zfill(4)
+    return sorted(set("".join(p) for p in itertools.permutations(member)))
+
+
+def family_from_member(member: str) -> str:
+    return "".join(sorted(set(member)))
+
+
+def vtrac_digit(d: int) -> int:
+    return (d % 5) + 1
+
+
+def mirror_digit(d: int) -> int:
+    return (d + 5) % 10
+
+
+def bucket_num(name: str, val: int, cuts: Sequence[int]) -> str:
+    prev = None
+    for c in cuts:
+        if val <= c:
+            if prev is None:
+                return f"{name}_le{c}"
+            return f"{name}_{prev+1}_{c}"
+        prev = c
+    return f"{name}_gt{cuts[-1]}"
+
+
+def seed_features(seed: str, member: Optional[str] = None) -> Dict[str, object]:
+    seed = norm4(seed) or "0000"
+    ds = [int(x) for x in seed]
+    cnt = Counter(ds)
+    s = sum(ds)
+    feats: Dict[str, object] = {}
+    feats["seed"] = seed
+    feats["sum"] = s
+    feats["sum_bucket"] = bucket_num("sum", s, [8, 12, 16, 20, 24])
+    feats["sum_mod10"] = s % 10
+    feats["root"] = 9 if s % 9 == 0 else s % 9
+    feats["spread"] = max(ds) - min(ds)
+    feats["spread_bucket"] = bucket_num("spread", int(feats["spread"]), [2, 4, 6, 8])
+    feats["unique"] = len(cnt)
+    feats["unique_bucket"] = f"unique_{len(cnt)}"
+    feats["max_rep"] = max(cnt.values())
+    feats["has_repeat"] = int(max(cnt.values()) > 1)
+    feats["structure"] = "".join(map(str, sorted(cnt.values(), reverse=True)))
+    feats["even_count"] = sum(d % 2 == 0 for d in ds)
+    feats["odd_count"] = 4 - int(feats["even_count"])
+    feats["even_sum"] = int(s % 2 == 0)
+    feats["high_count"] = sum(d >= 5 for d in ds)
+    feats["low_count"] = 4 - int(feats["high_count"])
+    feats["parity_pattern"] = "".join("E" if d % 2 == 0 else "O" for d in ds)
+    feats["highlow_pattern"] = "".join("H" if d >= 5 else "L" for d in ds)
+    feats["vtrac_pattern"] = "".join(str(vtrac_digit(d)) for d in ds)
+    feats["sorted_seed"] = "".join(map(str, sorted(ds)))
+    feats["first2"] = seed[:2]
+    feats["mid2"] = seed[1:3]
+    feats["last2"] = seed[2:]
+    feats["first_last"] = seed[0] + seed[3]
+    feats["first2_sum"] = ds[0] + ds[1]
+    feats["mid2_sum"] = ds[1] + ds[2]
+    feats["last2_sum"] = ds[2] + ds[3]
+    feats["firstlast_sum"] = ds[0] + ds[3]
+    for nm in ["first2_sum", "mid2_sum", "last2_sum", "firstlast_sum"]:
+        feats[f"{nm}_bucket"] = bucket_num(nm, int(feats[nm]), [4, 8, 12, 16])
+        feats[f"{nm}_parity"] = "E" if int(feats[nm]) % 2 == 0 else "O"
+        feats[f"{nm}_high"] = int(int(feats[nm]) >= 10)
+    for i, d in enumerate(ds, 1):
+        feats[f"pos{i}"] = d
+        feats[f"pos{i}_parity"] = "E" if d % 2 == 0 else "O"
+        feats[f"pos{i}_hl"] = "H" if d >= 5 else "L"
+        feats[f"pos{i}_v"] = vtrac_digit(d)
+    for k in range(10):
+        feats[f"has{k}"] = int(k in cnt)
+        feats[f"no{k}"] = int(k not in cnt)
+        feats[f"cnt{k}"] = cnt.get(k, 0)
+        for i, d in enumerate(ds, 1):
+            feats[f"pos{i}_is{k}"] = int(d == k)
+            feats[f"pos{i}_not{k}"] = int(d != k)
+    present_pairs = set()
+    for i in range(4):
+        for j in range(i + 1, 4):
+            present_pairs.add("".join(sorted([str(ds[i]), str(ds[j])])))
+    for a in range(10):
+        for b in range(a, 10):
+            tok = f"{a}{b}"
+            feats[f"pair_{tok}"] = int(tok in present_pairs)
+            feats[f"nopair_{tok}"] = int(tok not in present_pairs)
+    mirror_pairs = 0
+    plus1_pairs = 0
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if ds[j] == mirror_digit(ds[i]) or ds[i] == mirror_digit(ds[j]):
+                mirror_pairs += 1
+            if abs(ds[j] - ds[i]) == 1 or abs(ds[j] - ds[i]) == 9:
+                plus1_pairs += 1
+    feats["mirror_pairs"] = mirror_pairs
+    feats["mirror_bucket"] = bucket_num("mirror", mirror_pairs, [0, 1, 2, 3])
+    feats["plusminus1_pairs"] = plus1_pairs
+    feats["plusminus1_bucket"] = bucket_num("pm1", plus1_pairs, [0, 1, 2, 3])
+
+    # Target-member relationship features are generated dynamically so the same engine
+    # can support 025, 389, and future AABC members.
+    target_digits = sorted(set(norm_member(member) or ""))
+    for k in target_digits:
+        feats[f"target_has{k}"] = feats.get(f"has{k}", 0)
+        feats[f"target_no{k}"] = feats.get(f"no{k}", 1)
+    if target_digits:
+        feats["target_digit_count"] = sum(cnt.get(int(k), 0) for k in target_digits)
+        feats["target_digit_count_bucket"] = f"targetcnt_{feats['target_digit_count']}"
+        for a, b in itertools.combinations(target_digits, 2):
+            feats[f"has_{a}_{b}_pair"] = int(feats.get(f"has{a}", 0) and feats.get(f"has{b}", 0))
+    return feats
+
+
+def atom_set_for_seed(seed: str, member: str) -> set[str]:
+    feats = seed_features(seed, member)
+    atoms = set()
+    for k, v in feats.items():
+        if k == "seed":
+            continue
+        if pd.isna(v):
+            continue
+        atoms.add(f"{k}={v}")
+    return atoms
+
+# -------------------------
+# File reading / normalization
+# -------------------------
+
+
+def parse_printable_playlist_text(text: str) -> pd.DataFrame:
+    """Parse the user's printable playlist TXT format into rows.
+
+    Expected pattern:
+      1. Arkansas | Cash 4 Evening
+         PLAY: 0255  (1 play)
+         Running plays... | Fit: 30.43
+
+    This is intentionally permissive. If it cannot find PLAY rows, the normal
+    raw-line fallback still applies.
+    """
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    rows = []
+    current = {}
+    item_re = re.compile(r"^\s*(\d+)\.\s*(.*?)\s*\|\s*(.*?)\s*$")
+    play_re = re.compile(r"PLAY:\s*([0-9]{1,4})")
+    fit_re = re.compile(r"Fit:\s*([-+]?\d+(?:\.\d+)?)")
+    for ln in lines:
+        m = item_re.match(ln)
+        if m:
+            if current and current.get("member"):
+                rows.append(current)
+            current = {
+                "playlist_rank": int(m.group(1)),
+                "state": m.group(2).strip(),
+                "game": m.group(3).strip(),
+                "stream": f"{m.group(2).strip()} | {m.group(3).strip()}",
+            }
+            continue
+        pm = play_re.search(ln)
+        if pm and current is not None:
+            current["member"] = norm_member(pm.group(1)) or pm.group(1).zfill(4)
+            continue
+        fm = fit_re.search(ln)
+        if fm and current is not None:
+            current["fit_score"] = fm.group(1)
+    if current and current.get("member"):
+        rows.append(current)
+    return pd.DataFrame(rows)
+
+def read_table_upload(uploaded_file) -> pd.DataFrame:
+    name = getattr(uploaded_file, "name", "uploaded")
+    raw = uploaded_file.read()
+    if hasattr(uploaded_file, "seek"):
+        uploaded_file.seek(0)
+    lower = name.lower()
+    if lower.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(raw), dtype=str)
+    if lower.endswith(".tsv"):
+        return pd.read_csv(io.BytesIO(raw), dtype=str, sep="\t")
+    # TXT: first try the known printable playlist parser, then delimiter, then raw lines.
+    text = raw.decode("utf-8", errors="replace")
+    printable = parse_printable_playlist_text(text)
+    if not printable.empty:
+        return printable
+    try:
+        return pd.read_csv(io.StringIO(text), dtype=str, sep=None, engine="python")
+    except Exception:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        return pd.DataFrame({"raw_line": lines})
+
+
+def normalize_history(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    original_cols = list(out.columns)
+    out.columns = [str(c).strip() for c in out.columns]
+    lowmap = {c.lower().replace(" ", "").replace("_", ""): c for c in out.columns}
+
+    def find_col(cands: List[str]) -> Optional[str]:
+        for cand in cands:
+            key = cand.lower().replace(" ", "").replace("_", "")
+            if key in lowmap:
+                return lowmap[key]
+        for c in out.columns:
+            cl = c.lower()
+            if any(cand.lower() in cl for cand in cands):
+                return c
+        return None
+
+    date_col = find_col(["Date", "DrawDate", "event_date"])
+    r4_col = find_col(["Result4", "Result", "WinningNumber", "Number", "Draw"])
+    stream_col = find_col(["StreamKey", "Stream", "stream_key"])
+    state_col = find_col(["State", "Jurisdiction", "Lottery"])
+    game_col = find_col(["Game", "DrawName"])
+
+    if date_col is None or r4_col is None:
+        raise ValueError(f"History needs a date column and result/result4 column. Found columns: {original_cols}")
+    out["date"] = pd.to_datetime(out[date_col], errors="coerce")
+    out["r4"] = out[r4_col].apply(norm4)
+    if stream_col:
+        out["stream"] = out[stream_col].astype(str).str.strip()
+    elif state_col and game_col:
+        out["stream"] = out[state_col].astype(str).str.strip() + " | " + out[game_col].astype(str).str.strip()
+    else:
+        out["stream"] = "GLOBAL"
+    out = out.dropna(subset=["date", "r4"]).copy()
+    out["member"] = out["r4"].apply(lambda x: "".join(sorted(x)))
+    out = out.sort_values(["stream", "date"]).reset_index(drop=True)
+    return out[["date", "stream", "r4", "member"]]
+
+
+def normalize_playlist(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def detect_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    low = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower().replace(" ", "").replace("_", "")
+        if key in low:
+            return low[key]
+    for c in df.columns:
+        cl = c.lower()
+        if any(cand.lower() in cl for cand in candidates):
+            return c
+    return None
+
+# -------------------------
+# Rule database training / scoring
+# -------------------------
+
+def build_event_dataset_from_history(hist: pd.DataFrame, member: str) -> pd.DataFrame:
+    member = norm_member(member) or member
+    perms = unique_perms(member)
+    rows = []
+    for stream, g in hist.groupby("stream"):
+        g = g.sort_values("date").reset_index(drop=True)
+        for i in range(1, len(g)):
+            win = str(g.loc[i, "r4"])
+            if "".join(sorted(win)) != member:
+                continue
+            seed = str(g.loc[i - 1, "r4"])
+            if win not in perms:
+                continue
+            feats = seed_features(seed, member)
+            rows.append({
+                "event_idx": len(rows),
+                "event_date": g.loc[i, "date"],
+                "stream": stream,
+                "seed_date": g.loc[i - 1, "date"],
+                "seed": seed,
+                "member": member,
+                "winning_perm": win,
+                **feats,
+            })
+    ev = pd.DataFrame(rows)
+    if ev.empty:
+        return ev
+    ev = ev.sort_values(["event_date", "stream", "seed"]).reset_index(drop=True)
+    ev["event_idx"] = range(len(ev))
+    return ev
+
+
+def train_adaptive_gate_rules(
+    ev: pd.DataFrame,
+    member: str,
+    train_cutoff: Optional[pd.Timestamp] = None,
+    max_gate_size: int = 3,
+    min_rule_pos: int = 2,
+    max_outside: int = 1,
+    top_atoms_per_gate: int = 45,
+    max_rules_per_gate: int = 60,
+) -> pd.DataFrame:
+    if ev.empty:
+        return pd.DataFrame()
+    df = ev.copy()
+    df["event_date_dt"] = pd.to_datetime(df["event_date"], errors="coerce")
+    if train_cutoff is not None:
+        df = df[df["event_date_dt"] <= pd.to_datetime(train_cutoff)].copy()
+    df = df.reset_index(drop=True)
+    if len(df) < max(6, min_rule_pos):
+        return pd.DataFrame()
+    perms = unique_perms(member)
+    all_gates = []
+    for r in range(1, max_gate_size + 1):
+        all_gates.extend(list(itertools.combinations(perms, r)))
+    exclude = {"event_idx", "event_date", "event_date_dt", "seed_date", "winning_perm", "stream", "seed", "member"}
+    feat_cols = [c for c in df.columns if c not in exclude]
+
+    def row_atoms(row) -> set[str]:
+        ats = []
+        for c in feat_cols:
+            v = row[c]
+            if pd.isna(v) or str(v) == "":
+                continue
+            ats.append(f"{c}={v}")
+        return set(ats)
+
+    row_atom_sets = [row_atoms(df.iloc[i]) for i in range(len(df))]
+    atom_mask = defaultdict(int)
+    for local_i, atoms in enumerate(row_atom_sets):
+        bit = 1 << local_i
+        for a in atoms:
+            atom_mask[a] |= bit
+    all_train_mask = (1 << len(df)) - 1
+    perm_mask = {p: 0 for p in perms}
+    for local_i, row in df.iterrows():
+        perm = str(row["winning_perm"])
+        if perm in perm_mask:
+            perm_mask[perm] |= (1 << local_i)
+
+    def bc(x: int) -> int:
+        return x.bit_count()
+
+    lib = []
+    for gate in all_gates:
+        pos_mask = 0
+        for p in gate:
+            pos_mask |= perm_mask.get(p, 0)
+        pos_total = bc(pos_mask)
+        if pos_total < min_rule_pos:
+            continue
+        neg_mask = all_train_mask ^ pos_mask
+        candidates = []
+        for atom, mask in atom_mask.items():
+            ps = bc(mask & pos_mask)
+            if ps < min_rule_pos:
+                continue
+            ns = bc(mask & neg_mask)
+            pos_rate = ps / max(1, pos_total)
+            neg_rate = ns / max(1, len(df) - pos_total)
+            contrast = pos_rate - neg_rate
+            if ns > max_outside and contrast < 0.25:
+                continue
+            score = (ps - 1.75 * ns) + 2.5 * contrast + 0.15 * pos_rate
+            candidates.append((score, atom, mask, ps, ns, pos_rate, neg_rate))
+        candidates = sorted(candidates, reverse=True)[:top_atoms_per_gate]
+        rules = []
+
+        def add_rule(atoms: Tuple[str, ...], mask: int):
+            ps = bc(mask & pos_mask)
+            ns = bc(mask & neg_mask)
+            if ps < min_rule_pos or ns > max_outside:
+                return
+            pos_rate = ps / max(1, pos_total)
+            purity = ps / (ps + ns) if ps + ns else 0.0
+            spec = len(atoms)
+            score = (purity * 5.0 + ps * 0.9 + pos_rate * 2.0 - ns * 2.2 + spec * 0.18 - len(gate) * 0.20)
+            rules.append((score, atoms, ps, ns, purity, pos_rate))
+
+        for _, a, m, *_ in candidates:
+            add_rule((a,), m)
+        for i in range(len(candidates)):
+            a1, m1 = candidates[i][1], candidates[i][2]
+            for j in range(i + 1, len(candidates)):
+                a2, m2 = candidates[j][1], candidates[j][2]
+                add_rule((a1, a2), m1 & m2)
+        top3 = candidates[:22]
+        for i in range(len(top3)):
+            a1, m1 = top3[i][1], top3[i][2]
+            for j in range(i + 1, len(top3)):
+                a2, m2 = top3[j][1], top3[j][2]
+                m12 = m1 & m2
+                if bc(m12 & pos_mask) < min_rule_pos:
+                    continue
+                for k in range(j + 1, len(top3)):
+                    a3, m3 = top3[k][1], top3[k][2]
+                    add_rule((a1, a2, a3), m12 & m3)
+        rules = sorted(rules, key=lambda x: x[0], reverse=True)[:max_rules_per_gate]
+        for score, atoms, ps, ns, purity, pos_rate in rules:
+            lib.append({
+                "member": member,
+                "gate_tuple": repr(tuple(gate)),
+                "gate": "|".join(gate),
+                "train_pos": ps,
+                "train_out": ns,
+                "purity": purity,
+                "pos_rate": pos_rate,
+                "rule_score": score,
+                "atoms_str": " & ".join(atoms),
+                "train_cutoff": str(pd.to_datetime(train_cutoff).date()) if train_cutoff is not None else "FULL_HISTORY",
+                "rule_source": BUILD_ID,
+            })
+    return pd.DataFrame(lib)
+
+
+def load_rule_db_from_upload(upload) -> pd.DataFrame:
+    df = read_table_upload(upload)
+    return normalize_rule_db(df)
+
+
+def normalize_rule_db(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    if "member" not in out.columns:
+        # Legacy single-member db. User can still use it after assigning in UI if needed.
+        out["member"] = ""
+    required = ["member", "gate", "atoms_str", "rule_score", "train_pos", "train_out", "purity", "pos_rate"]
+    for c in required:
+        if c not in out.columns:
+            out[c] = ""
+    for c in ["rule_score", "train_pos", "train_out", "purity", "pos_rate"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["member"] = out["member"].apply(lambda x: norm_member(x) or str(x).zfill(4) if str(x).strip() else "")
+    out["gate"] = out["gate"].astype(str)
+    out["atoms_str"] = out["atoms_str"].astype(str)
+    return out
+
+
+def score_member_seed(member: str, seed: str, rules: pd.DataFrame, top_n_gates: int = 6) -> Tuple[List[dict], pd.DataFrame]:
+    member = norm_member(member) or str(member).zfill(4)
+    perms = unique_perms(member)
+    atoms = atom_set_for_seed(seed, member)
+    sub = rules[rules["member"].eq(member)].copy()
+    all_gates = []
+    for r in (1, 2, 3):
+        all_gates.extend(["|".join(g) for g in itertools.combinations(perms, r)])
+    fired_rows = []
+    if not sub.empty:
+        for _, row in sub.iterrows():
+            atom_str = str(row.get("atoms_str", ""))
+            req = [a.strip() for a in atom_str.split("&") if a.strip()]
+            if req and all(a in atoms for a in req):
+                fired_rows.append(row.to_dict())
+    fired_df = pd.DataFrame(fired_rows)
+    scored = []
+    if not fired_df.empty:
+        for gate, g in fired_df.groupby("gate"):
+            scores = sorted(pd.to_numeric(g["rule_score"], errors="coerce").fillna(0).tolist(), reverse=True)
+            best = g.sort_values(["rule_score", "train_pos", "train_out"], ascending=[False, False, True]).iloc[0]
+            agg = sum(scores[:3])
+            # Prefer strong rule stacks and smaller gates if scores tie.
+            gate_size = len(str(gate).split("|"))
+            final_score = float(best["rule_score"]) * 1.6 + agg * 0.25 - 0.08 * gate_size
+            scored.append({
+                "gate": gate,
+                "gate_size": gate_size,
+                "score": final_score,
+                "rule_count": len(g),
+                "best_rule": str(best.get("atoms_str", "")),
+                "best_rule_score": float(best.get("rule_score", 0)),
+                "best_train_pos": int(best.get("train_pos", 0)),
+                "best_train_out": int(best.get("train_out", 0)),
+            })
+    # Add fallback gates with frequency-neutral score so output is never empty.
+    existing = {s["gate"] for s in scored}
+    for gate in all_gates:
+        if gate not in existing:
+            scored.append({"gate": gate, "gate_size": len(gate.split("|")), "score": -999 - 0.1 * len(gate.split("|")), "rule_count": 0, "best_rule": "NO_RULE_FIRED", "best_rule_score": 0, "best_train_pos": 0, "best_train_out": 0})
+    scored = sorted(scored, key=lambda x: (x["score"], x["rule_count"], -x["gate_size"]), reverse=True)
+    return scored[:top_n_gates], fired_df
+
+
+def candidates_from_top_gates(scored: List[dict], n: int) -> List[str]:
+    seen: List[str] = []
+    for g in scored[:n]:
+        for p in str(g["gate"]).split("|"):
+            if p and p not in seen:
+                seen.append(p)
+    return seen
+
+
+def history_frequency_order(hist: pd.DataFrame, member: str, train_cutoff: Optional[pd.Timestamp] = None) -> List[str]:
+    ev = build_event_dataset_from_history(hist, member)
+    if ev.empty:
+        return unique_perms(member)
+    if train_cutoff is not None:
+        ev = ev[pd.to_datetime(ev["event_date"]) <= pd.to_datetime(train_cutoff)]
+    vc = ev["winning_perm"].value_counts().to_dict()
+    perms = unique_perms(member)
+    return sorted(perms, key=lambda p: (-vc.get(p, 0), p))
+
+
+def find_seed_from_history(hist: pd.DataFrame, stream: str, play_date: Optional[pd.Timestamp]) -> Optional[str]:
+    if hist is None or hist.empty or not stream:
+        return None
+    h = hist[hist["stream"].astype(str).eq(str(stream))].copy()
+    if h.empty:
+        return None
+    if play_date is not None and not pd.isna(play_date):
+        h = h[h["date"] < pd.to_datetime(play_date)]
+    if h.empty:
+        return None
+    return str(h.sort_values("date").iloc[-1]["r4"])
+
+
+
+def backtest_truth_member(
+    hist: pd.DataFrame,
+    rules: pd.DataFrame,
+    family: str,
+    members: Sequence[str],
+    train_cutoff: pd.Timestamp,
+    test_start: Optional[pd.Timestamp] = None,
+    test_end: Optional[pd.Timestamp] = None,
+    top_gate_levels: Sequence[int] = (1, 2, 3),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Historical straight-layer test assuming the boxed member is known/correct.
+
+    This does NOT test the member engine. It auto-creates historical playlist rows
+    from actual family wins and asks: once the member is known, did the straight
+    gate candidates include the exact straight?
+    """
+    family = "".join(sorted(set(str(family).zfill(3))))
+    members = [norm_member(m) for m in members if norm_member(m)]
+    members = [m for m in members if is_aabc_member(m) and family_from_member(m) == family]
+    rows = []
+    for m in members:
+        ev = build_event_dataset_from_history(hist, m)
+        if ev.empty:
+            continue
+        ev["event_date_dt"] = pd.to_datetime(ev["event_date"], errors="coerce")
+        ev = ev[ev["event_date_dt"] > pd.to_datetime(train_cutoff)].copy()
+        if test_start is not None:
+            ev = ev[ev["event_date_dt"] >= pd.to_datetime(test_start)].copy()
+        if test_end is not None:
+            ev = ev[ev["event_date_dt"] <= pd.to_datetime(test_end)].copy()
+        freq_order = history_frequency_order(hist, m, train_cutoff=train_cutoff)
+        for _, r in ev.iterrows():
+            seed = str(r["seed"])
+            actual = str(r["winning_perm"])
+            scored, fired = score_member_seed(m, seed, rules, top_n_gates=max(top_gate_levels) if top_gate_levels else 3)
+            rec = {
+                "event_date": pd.to_datetime(r["event_date"]).date().isoformat(),
+                "stream": r["stream"],
+                "family": family,
+                "member": m,
+                "seed_date": pd.to_datetime(r["seed_date"]).date().isoformat(),
+                "seed": seed,
+                "actual_straight": actual,
+                "available_rule_count_for_member": int((rules["member"] == m).sum()) if not rules.empty else 0,
+                "frequency_rank": (freq_order.index(actual) + 1) if actual in freq_order else None,
+            }
+            for n in top_gate_levels:
+                cands = candidates_from_top_gates(scored, n) if scored else freq_order[:min(12, n*3)]
+                rec[f"top{n}_gate_candidates"] = "|".join(cands)
+                rec[f"top{n}_gate_play_count"] = len(cands)
+                rec[f"top{n}_gate_captured"] = int(actual in cands)
+            if scored:
+                rec["top1_gate"] = scored[0].get("gate", "")
+                rec["top1_gate_size"] = scored[0].get("gate_size", "")
+                rec["top1_best_rule"] = scored[0].get("best_rule", "")
+                rec["top1_score"] = scored[0].get("score", "")
+            else:
+                rec["top1_gate"] = "NO_RULES_FREQ_FALLBACK"
+                rec["top1_gate_size"] = ""
+                rec["top1_best_rule"] = "NO_RULES_FREQ_FALLBACK"
+                rec["top1_score"] = ""
+            rows.append(rec)
+    events = pd.DataFrame(rows).sort_values(["event_date", "stream", "member"]).reset_index(drop=True) if rows else pd.DataFrame()
+    summary_rows = []
+    if not events.empty:
+        total_family_events = len(events)
+        for n in top_gate_levels:
+            summary_rows.append({
+                "scope": f"family_{family}_truth_member_future_after_{pd.to_datetime(train_cutoff).date()}",
+                "gate_level": f"Top{n} gates",
+                "captured_straight_wins": int(events[f"top{n}_gate_captured"].sum()),
+                "denominator_family_wins": total_family_events,
+                "capture_pct": round(float(events[f"top{n}_gate_captured"].mean()) * 100, 2),
+                "total_straight_plays": int(events[f"top{n}_gate_play_count"].sum()),
+                "avg_plays_per_family_win": round(float(events[f"top{n}_gate_play_count"].mean()), 3),
+                "members_included": ",".join(sorted(events["member"].unique())),
+            })
+        for m, g in events.groupby("member"):
+            for n in top_gate_levels:
+                summary_rows.append({
+                    "scope": f"member_{m}_truth_member_future_after_{pd.to_datetime(train_cutoff).date()}",
+                    "gate_level": f"Top{n} gates",
+                    "captured_straight_wins": int(g[f"top{n}_gate_captured"].sum()),
+                    "denominator_family_wins": total_family_events,
+                    "subset_member_wins": len(g),
+                    "capture_pct_within_member": round(float(g[f"top{n}_gate_captured"].mean()) * 100, 2),
+                    "capture_pct_of_family_denominator": round(int(g[f"top{n}_gate_captured"].sum()) / max(1, total_family_events) * 100, 2),
+                    "total_straight_plays": int(g[f"top{n}_gate_play_count"].sum()),
+                    "avg_plays_per_member_win": round(float(g[f"top{n}_gate_play_count"].mean()), 3),
+                    "members_included": m,
+                })
+    return events, pd.DataFrame(summary_rows)
+
+
+def make_backtest_txt(summary: pd.DataFrame, events: pd.DataFrame, train_cutoff) -> str:
+    lines = [f"{BUILD_ID} HISTORICAL TRUTH-MEMBER BACKTEST", "="*78, f"Training cutoff: {pd.to_datetime(train_cutoff).date()}", ""]
+    if summary.empty:
+        lines.append("No backtest events found.")
+        return "\n".join(lines)
+    lines.append("SUMMARY")
+    lines.append(summary.to_string(index=False))
+    lines.append("")
+    lines.append("EVENTS")
+    show_cols = [c for c in ["event_date","stream","member","seed","actual_straight","top1_gate_candidates","top1_gate_captured","top2_gate_candidates","top2_gate_captured","top3_gate_candidates","top3_gate_captured"] if c in events.columns]
+    lines.append(events[show_cols].to_string(index=False))
+    return "\n".join(lines)
+
+def make_txt_report(out: pd.DataFrame) -> str:
+    lines = [f"{BUILD_ID} STRAIGHT PLAY DECISION OUTPUT", "=" * 72, ""]
+    for _, r in out.iterrows():
+        lines.append(f"Stream: {r.get('stream','')}")
+        lines.append(f"Date: {r.get('play_date','')} | Member: {r.get('member','')} | Seed: {r.get('seed','')}")
+        lines.append(f"Top1 Gate: {r.get('top1_gate','')} | Gate Plays: {r.get('top1_candidates','')}")
+        lines.append(f"Provisional single straight: {r.get('single_straight_candidate','')}")
+        lines.append(f"Reason: {r.get('top1_best_rule','')}")
+        lines.append("-" * 72)
+    return "\n".join(lines)
+
+# -------------------------
+# Streamlit UI
+# -------------------------
+
+st.set_page_config(page_title="AABC Straight Play Decision Engine", layout="wide")
+st.title("AABC Straight Play Decision Engine")
+st.caption(BUILD_ID)
+
+st.markdown(
+    "This companion app uses a known boxed member from your final daily playlist and recommends exact straight candidates using the trained adaptive-gate rule database."
+)
+
+with st.sidebar:
+    st.header("Inputs")
+    history_file = st.file_uploader("History file (.csv/.txt/.tsv)", type=["csv", "txt", "tsv"])
+    playlist_file = st.file_uploader("Final daily playlist (.csv/.txt/.tsv)", type=["csv", "txt", "tsv"])
+    rule_file = st.file_uploader("Optional rule database (.csv/.txt)", type=["csv", "txt", "tsv"])
+    train_cutoff = st.date_input("Training cutoff for rebuilding rules", value=None)
+    st.caption("If no rule database is uploaded, the app tries to use the packaged CORE025 v1 rule database.")
+
+# Load history
+hist_norm = pd.DataFrame()
+if history_file is not None:
+    try:
+        hist_raw = read_table_upload(history_file)
+        hist_norm = normalize_history(hist_raw)
+        st.success(f"Loaded history: {len(hist_norm):,} rows, {hist_norm['date'].min().date()} through {hist_norm['date'].max().date()}.")
+    except Exception as e:
+        st.error(f"Could not read history: {e}")
+
+# Load rules
+rule_db = pd.DataFrame()
+if rule_file is not None:
+    try:
+        rule_db = load_rule_db_from_upload(rule_file)
+        st.success(f"Loaded rule database: {len(rule_db):,} rules for {rule_db['member'].nunique()} members.")
+    except Exception as e:
+        st.error(f"Could not read rule database: {e}")
+else:
+    p = Path(__file__).with_name(DEFAULT_RULE_DB)
+    if p.exists():
+        rule_db = normalize_rule_db(pd.read_csv(p, dtype=str))
+        st.info(f"Using packaged rule database: {len(rule_db):,} rules for {rule_db['member'].nunique()} members.")
+    else:
+        local_p = Path(DEFAULT_RULE_DB)
+        if local_p.exists():
+            rule_db = normalize_rule_db(pd.read_csv(local_p, dtype=str))
+            st.info(f"Using local rule database: {len(rule_db):,} rules.")
+        else:
+            st.warning("No rule database found. Upload one or rebuild from history below.")
+
+st.subheader("Rule database builder / updater")
+with st.expander("Build or update member rule database", expanded=False):
+    st.write("Use this to add new AABC members as we expand to more cores. Enter members as 4 digits, comma-separated.")
+    members_text = st.text_input("Members to train", value="0025,0225,0255")
+    max_gate_size = st.slider("Max gate size", min_value=1, max_value=3, value=3)
+    min_rule_pos = st.slider("Minimum target support per rule", min_value=1, max_value=5, value=2)
+    if st.button("Train/update rule database from uploaded history", type="primary"):
+        if hist_norm.empty:
+            st.error("Upload a history file first.")
+        else:
+            members = []
+            for part in re.split(r"[,;\s]+", members_text.strip()):
+                if not part:
+                    continue
+                m = norm_member(part)
+                if m and is_aabc_member(m):
+                    members.append(m)
+            if not members:
+                st.error("No valid AABC members found.")
+            else:
+                dfs = []
+                prog = st.progress(0)
+                for idx, m in enumerate(members):
+                    st.write(f"Training {m}...")
+                    ev = build_event_dataset_from_history(hist_norm, m)
+                    cutoff_ts = pd.to_datetime(train_cutoff) if train_cutoff else None
+                    lib = train_adaptive_gate_rules(ev, m, cutoff_ts, max_gate_size=max_gate_size, min_rule_pos=min_rule_pos)
+                    if not lib.empty:
+                        dfs.append(lib)
+                    prog.progress((idx + 1) / len(members))
+                new_db = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                if not rule_db.empty:
+                    combined = pd.concat([rule_db, new_db], ignore_index=True)
+                    # Dedupe exact same member/gate/atoms/cutoff.
+                    combined = combined.drop_duplicates(subset=["member", "gate", "atoms_str", "train_cutoff"], keep="last")
+                else:
+                    combined = new_db
+                st.session_state["trained_rule_db"] = combined
+                st.success(f"Updated rule database: {len(combined):,} rules.")
+
+if "trained_rule_db" in st.session_state:
+    rule_db = normalize_rule_db(st.session_state["trained_rule_db"])
+
+if not rule_db.empty:
+    csv_bytes = rule_db.to_csv(index=False).encode("utf-8")
+    txt_bytes = rule_db.to_csv(index=False, sep="\t").encode("utf-8")
+    c1, c2 = st.columns(2)
+    c1.download_button("Download rule DB CSV", csv_bytes, file_name="straight_rule_database_updated.csv", mime="text/csv")
+    c2.download_button("Download rule DB TXT", txt_bytes, file_name="straight_rule_database_updated.txt", mime="text/plain")
+
+st.subheader("Straight-play decision output")
+if playlist_file is None:
+    st.info("Upload the final daily playlist to generate straight recommendations.")
+else:
+    try:
+        playlist_raw = read_table_upload(playlist_file)
+        playlist = normalize_playlist(playlist_raw)
+        st.write("Playlist preview")
+        st.dataframe(playlist.head(25), use_container_width=True)
+
+        auto_member = detect_column(playlist, ["chosen_member", "selected_member", "member", "top1member", "top_member", "finalmember", "recommendmember", "box_member"])
+        auto_seed = detect_column(playlist, ["seed", "last_seed", "prior_result", "previous_result", "seed_result"])
+        auto_stream = detect_column(playlist, ["stream", "streamkey", "stream_key", "StreamKey"])
+        auto_date = detect_column(playlist, ["play_date", "date", "prediction_date", "target_date"])
+
+        c1, c2, c3, c4 = st.columns(4)
+        member_col = c1.selectbox("Member column", options=list(playlist.columns), index=list(playlist.columns).index(auto_member) if auto_member in playlist.columns else 0)
+        seed_options = ["<derive from history>"] + list(playlist.columns)
+        seed_col = c2.selectbox("Seed column", options=seed_options, index=(seed_options.index(auto_seed) if auto_seed in seed_options else 0))
+        stream_options = ["<none>"] + list(playlist.columns)
+        stream_col = c3.selectbox("Stream column", options=stream_options, index=(stream_options.index(auto_stream) if auto_stream in stream_options else 0))
+        date_options = ["<none>"] + list(playlist.columns)
+        date_col = c4.selectbox("Play date column", options=date_options, index=(date_options.index(auto_date) if auto_date in date_options else 0))
+
+        top_n_gates = st.slider("How many gates to display", min_value=1, max_value=6, value=3)
+        output_rows = []
+        fired_all = []
+        for idx, row in playlist.iterrows():
+            member = norm_member(row.get(member_col))
+            if not member or not is_aabc_member(member):
+                continue
+            play_date = None
+            if date_col != "<none>":
+                play_date = pd.to_datetime(row.get(date_col), errors="coerce")
+            stream = str(row.get(stream_col, "")) if stream_col != "<none>" else ""
+            if seed_col != "<derive from history>":
+                seed = norm4(row.get(seed_col))
+            else:
+                seed = find_seed_from_history(hist_norm, stream, play_date) if not hist_norm.empty else None
+            if not seed:
+                output_rows.append({
+                    "playlist_row": idx,
+                    "stream": stream,
+                    "play_date": str(play_date.date()) if play_date is not None and not pd.isna(play_date) else "",
+                    "member": member,
+                    "seed": "MISSING",
+                    "status": "NO SEED AVAILABLE",
+                })
+                continue
+            scored, fired = score_member_seed(member, seed, rule_db, top_n_gates=max(6, top_n_gates)) if not rule_db.empty else ([], pd.DataFrame())
+            if not scored:
+                scored = []
+            # Frequency fallback order for provisional single ranking.
+            freq_order = history_frequency_order(hist_norm, member) if not hist_norm.empty else unique_perms(member)
+            top1_cands = candidates_from_top_gates(scored, 1) if scored else freq_order[:3]
+            top2_cands = candidates_from_top_gates(scored, 2) if scored else freq_order[:6]
+            top3_cands = candidates_from_top_gates(scored, 3) if scored else freq_order[:9]
+            # Provisional single straight: highest frequency among Top1 gate candidates.
+            single = sorted(top1_cands, key=lambda p: (freq_order.index(p) if p in freq_order else 999, p))[0] if top1_cands else ""
+            rec = {
+                "playlist_row": idx,
+                "stream": stream,
+                "play_date": str(play_date.date()) if play_date is not None and not pd.isna(play_date) else "",
+                "member": member,
+                "family": family_from_member(member),
+                "seed": seed,
+                "status": "OK" if not rule_db.empty else "NO RULE DB - FREQ FALLBACK",
+                "top1_gate": scored[0]["gate"] if scored else "FREQ_FALLBACK",
+                "top1_gate_size": len(top1_cands),
+                "top1_candidates": "|".join(top1_cands),
+                "top2_gate_candidates": "|".join(top2_cands),
+                "top3_gate_candidates": "|".join(top3_cands),
+                "single_straight_candidate": single,
+                "top1_best_rule": scored[0]["best_rule"] if scored else "FREQ_FALLBACK",
+                "top1_rule_count": scored[0]["rule_count"] if scored else 0,
+                "top1_score": round(scored[0]["score"], 4) if scored else 0,
+            }
+            output_rows.append(rec)
+            if fired is not None and not fired.empty:
+                tmp = fired.copy()
+                tmp.insert(0, "playlist_row", idx)
+                tmp.insert(1, "member", member)
+                tmp.insert(2, "seed", seed)
+                fired_all.append(tmp)
+        out = pd.DataFrame(output_rows)
+        st.write("Straight recommendations")
+        st.dataframe(out, use_container_width=True)
+        if not out.empty:
+            csv = out.to_csv(index=False).encode("utf-8")
+            txt = make_txt_report(out).encode("utf-8")
+            c1, c2 = st.columns(2)
+            c1.download_button("Download straight recommendations CSV", csv, file_name="straight_play_recommendations.csv", mime="text/csv")
+            c2.download_button("Download straight recommendations TXT", txt, file_name="straight_play_recommendations.txt", mime="text/plain")
+        if fired_all:
+            fired_df = pd.concat(fired_all, ignore_index=True)
+            st.write("Fired rule detail")
+            st.dataframe(fired_df.head(500), use_container_width=True)
+            st.download_button("Download fired rule detail CSV", fired_df.to_csv(index=False).encode("utf-8"), file_name="straight_fired_rule_detail.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Could not process playlist: {e}")
+
+
+st.subheader("Historical backtest mode — no winning playlist required")
+st.caption("This is a straight-layer test. It assumes the boxed member is known/correct from the member engine, then tests exact-straight gates on later history.")
+with st.expander("Run truth-member historical backtest", expanded=False):
+    if hist_norm.empty:
+        st.info("Upload a history file first.")
+    elif rule_db.empty:
+        st.info("Load or train a rule database first.")
+    else:
+        bc1, bc2, bc3 = st.columns(3)
+        bt_family = bc1.text_input("Core family", value="025")
+        bt_members = bc2.text_input("Members to include", value="0025,0225,0255")
+        default_cutoff = pd.Timestamp("2026-02-20")
+        min_d = hist_norm["date"].min().date()
+        max_d = hist_norm["date"].max().date()
+        cutoff_val = default_cutoff.date() if min_d <= default_cutoff.date() <= max_d else max_d
+        bt_cutoff = bc3.date_input("Train through date", value=cutoff_val, min_value=min_d, max_value=max_d)
+        bc4, bc5 = st.columns(2)
+        bt_start = bc4.date_input("Optional test start", value=pd.to_datetime(bt_cutoff).date(), min_value=min_d, max_value=max_d)
+        bt_end = bc5.date_input("Optional test end", value=max_d, min_value=min_d, max_value=max_d)
+        st.caption("Events must be after the train-through date. The summary denominator is all future wins for the selected family/members in this test window.")
+        if st.button("Run historical straight backtest", type="primary"):
+            mems = [norm_member(x) for x in re.split(r"[,;\s]+", bt_members) if norm_member(x)]
+            events, summ = backtest_truth_member(
+                hist_norm,
+                rule_db,
+                family=bt_family,
+                members=mems,
+                train_cutoff=pd.to_datetime(bt_cutoff),
+                test_start=pd.to_datetime(bt_start) if bt_start else None,
+                test_end=pd.to_datetime(bt_end) if bt_end else None,
+                top_gate_levels=(1,2,3),
+            )
+            st.session_state["backtest_events"] = events
+            st.session_state["backtest_summary"] = summ
+            st.session_state["backtest_cutoff"] = pd.to_datetime(bt_cutoff)
+
+if "backtest_summary" in st.session_state:
+    st.write("Backtest summary")
+    st.dataframe(st.session_state["backtest_summary"], use_container_width=True)
+    st.write("Backtest events")
+    st.dataframe(st.session_state["backtest_events"], use_container_width=True)
+    bt_summary = st.session_state["backtest_summary"]
+    bt_events = st.session_state["backtest_events"]
+    bt_txt = make_backtest_txt(bt_summary, bt_events, st.session_state.get("backtest_cutoff", pd.Timestamp("today"))).encode("utf-8")
+    bc1, bc2, bc3 = st.columns(3)
+    bc1.download_button("Download backtest summary CSV", bt_summary.to_csv(index=False).encode("utf-8"), file_name="straight_backtest_summary.csv", mime="text/csv")
+    bc2.download_button("Download backtest events CSV", bt_events.to_csv(index=False).encode("utf-8"), file_name="straight_backtest_events.csv", mime="text/csv")
+    bc3.download_button("Download backtest TXT", bt_txt, file_name="straight_backtest_report.txt", mime="text/plain")
+
+st.divider()
+st.caption("Scope note: current packaged rules cover CORE025 members 0025, 0225, and 0255. Use the trainer to add future members as we build them.")
